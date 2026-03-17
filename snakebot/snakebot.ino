@@ -1,312 +1,405 @@
-// ESP32 version
+#include <Arduino.h>
 #include <ESP32Servo.h>
+
 #include <Wire.h>
 #include <Adafruit_BNO08x.h>
+#include <sh2.h>
 
-// ========================= IMU (BNO08x) SETUP =========================
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include "esp_wifi.h"
+#include "esp_wpa2.h"
+#include <string.h>
+#include <stdlib.h>
 
-// I2C IMU (Adafruit BNO08x breakout, addr 0x4A on ESP32 default I2C)
-Adafruit_BNO08x bno(55);
+/*********************************************
+* WIFI / UDP
+**********************************************/
+const char* SSID = "UofT";
+const char* EAP_IDENTITY = "quwenhao";
+const char* EAP_USERNAME = "quwenhao";
+const char* EAP_PASSWORD = "Maplehong0102";
+
+constexpr uint16_t UDP_PORT = 6657;
+WiFiUDP Udp;
+char udpBuf[256];
+
+/*********************************************
+* GLOBALS / MACROS
+**********************************************/
+
+static constexpr int PIN_BNO_CS = 27;
+static constexpr int PIN_BNO_INT = 26;
+static constexpr int PIN_BNO_RST = 25;
+const float DECLINATION_DEG = -10.0f; // Toronto ≈ -10
+constexpr int NUM_SERVOS = 8;
+Adafruit_BNO08x bno(PIN_BNO_RST);
 sh2_SensorValue_t imuVal;
+int servoPins[NUM_SERVOS] = { 33, 32, 22, 21, 17, 16, 14, 13 };
+Servo myServos[NUM_SERVOS];
+constexpr float TURNING_DEGREE = 45.0f;
 
-// Change for your location: east = +, west = - (Toronto ≈ -10)
-const float DECLINATION_DEG = -10.0f;
+// Returns true once per `period_ms` for each unique call-site.
+#define DO_PERIODIC_MS(period_ms) \
+  if ([](uint32_t _p)->bool { \
+        static uint32_t _last = 0; \
+        const uint32_t _now = millis(); \
+        if ((uint32_t)(_now - _last) >= _p) { _last = _now; return true; } \
+        return false; \
+      }((uint32_t)(period_ms)))
+#define PRINT_PERIOD_MS 2000
 
-// Wrap [0,360)
+/*********************************************
+* CLASS / STRUCT DEFINITIONS
+**********************************************/
+
+enum class RunState : uint8_t {
+  Warmup,
+  WaitForHeading,
+  Idle,
+  Running
+};
+
+struct HeadingState {
+  float trueDeg = 0.0f;
+  bool haveHeading = false;
+  float filtDeg = 0.0f;
+  bool filtInit = false;
+};
+static HeadingState g_heading;
+
+struct SlitherState {
+  float offset;
+  int amplitude;
+  float speed;
+  float wavelengths;
+  uint32_t lastUpdateMs;
+  float phase;
+};
+const SlitherState RUN_SLITHER_STATE = { 0.0f, 30, 1.0f, 1.0f, 0, 0.0f };
+const SlitherState STOP_SLITHER_STATE = { 0.0f, 0, 0.0f, 1.0f, 0, 0.0f };
+SlitherState g_slither = { 0.0f, 30, 1.0f, 1.0f, 0, 0.0f };
+
+/*********************************************
+* COMMAND STATE
+**********************************************/
+static RunState g_runState = RunState::Warmup;
+static float g_targetHeading = 0.0f;
+
+/*********************************************
+* FUNCTION PROTOTYPES
+**********************************************/
+static inline float wrap360(float d);
+static inline float wrap180(float d);
+static float clampf(float x, float lo, float hi);
+
+void setReports();
+void initIMU();
+void attachAllServos();
+void centerAll();
+void setSlitherParams(float offset, int Amplitude, float Speed, float Wavelengths);
+
+float get_yaw_game();
+void updateHeadingFromIMU();
+float getFilteredErr(float targetDeg);
+void moveTowardsHeading(float targetDeg);
+void slitherStep();
+
+void connectWiFi();
+void initUDP();
+void processUdpPackets();
+bool getParamValue(const char* msg, const char* key, char* out, size_t outSize);
+void handleCommand(const char* cmd, float directionDeg);
+void stopMotion();
+
+/*********************************************
+* FUNCTION DEFINITIONS
+**********************************************/
+
 static inline float wrap360(float d) {
-  while (d < 0.0f)    d += 360.0f;
+  while (d < 0.0f) d += 360.0f;
   while (d >= 360.0f) d -= 360.0f;
   return d;
 }
 
-// Wrap to [-180,180)
 static inline float wrap180(float d) {
-  d = wrap360(d);      // first ensure [0,360)
-  if (d >= 180.0f) {
-    d -= 360.0f;
-  }
+  d = wrap360(d);
+  if (d >= 180.0f) d -= 360.0f;
   return d;
 }
 
-// Global heading (TRUE, i.e., magnetic + declination)
-float g_true_heading = 0.0f;
-bool  g_have_heading = false;
-// Filtered heading (for smoothing)
-float g_filt_heading = 0.0f;
-bool  g_filt_init    = false;
+static float clampf(float x, float lo, float hi) {
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
 
+void setReports() {
+  if (!bno.enableReport(SH2_GAME_ROTATION_VECTOR, 20000)) {
+    Serial.println("Could not enable rotation vector");
+    while (1) delay(10);
+  }
+}
 
-// Initialize IMU
 void initIMU() {
   Serial.println("[DEBUG] initIMU() start");
-  Wire.begin(21, 22);  // SDA, SCL for ESP32
   Serial.println("Starting BNO08x...");
-  if (!bno.begin_I2C(0x4A, &Wire)) {
-    Serial.println("BNO08x not found");
-    while (1) { delay(10); }
+
+  if (!bno.begin_SPI(PIN_BNO_CS, PIN_BNO_INT)) {
+    Serial.println("Failed to find BNO08x chip");
+    while (1) delay(10);
   }
 
   Serial.println("BNO08x found!");
-
-  // Optional: set to Game Rotation Vector for headset-like orientation
-  bno.enableReport(SH2_ROTATION_VECTOR, 100000);  // 10 ms = 100 Hz
-  // Or use 100000 for 10 Hz, etc.
-
-  // Small delay for stability
+  setReports();
   delay(100);
 }
 
-// Call this often (e.g., once per loop) to refresh heading if a new IMU
-// sample is available. It does NOT block.
-void updateHeadingFromIMU() {
-  // Serial.println("[DEBUG] updateHeadingFromIMU() start");
-  if (bno.getSensorEvent(&imuVal) &&
-      imuVal.sensorId == SH2_ROTATION_VECTOR) {
-
-    // Serial.println("in the update");
-    
-    float r = imuVal.un.rotationVector.real;
-    float i = imuVal.un.rotationVector.i;
-    float j = imuVal.un.rotationVector.j;
-    float k = imuVal.un.rotationVector.k;
-
-    float ysqr = j * j;
-
-    // Yaw (Z axis rotation)
-    float t3   = +2.0f * (r * k + i * j);
-    float t4   = +1.0f - 2.0f * (ysqr + k * k);
-    float yaw  = atan2f(t3, t4) * 180.0f / PI;   // in degrees
-
-    // Convert to [0,360)
-    yaw = wrap360(yaw);
-
-    // Convert MAGNETIC heading to TRUE using local declination
-    float trueDeg = yaw + DECLINATION_DEG;
-    trueDeg = wrap360(trueDeg);
-
-    // ---- low-pass filter on a circle ----
-    if (!g_filt_init) {
-      g_filt_heading = trueDeg;
-      g_filt_init    = true;
-    }
-
-    const float alpha = 0.1f;   // smoothing factor (0<alpha<=1), smaller = smoother
-    // Filter the heading error (handles wrap-around properly)
-    float err = wrap180(trueDeg - g_filt_heading);
-    g_filt_heading = wrap360(g_filt_heading + alpha * err);
-
-    // Expose filtered heading to the rest of the code
-    g_true_heading = g_filt_heading;
-    g_have_heading = true;
-
-    Serial.print("Raw yaw: ");
-    Serial.print(yaw);
-    Serial.print(" deg, TRUE filtered heading: ");
-    Serial.print(g_true_heading);
-    Serial.println(" deg");
-  }
-}
-
-// ========================= SERVO / GAIT CODE =========================
-
-
-
-// Pick ONLY output-capable, non-strap GPIOs for PWM.
-// Avoid 0, 2, 12, 15; avoid input-only 34–39.
-// Adjust this list to your wiring.
-// int servoPins[NUM_SERVOS] = {
-//   13, 14, 16, 17, 18, 19, 21, 22, 23, 25
-// };
-
-constexpr int NUM_SERVOS = 6;
-
-int servoPins[NUM_SERVOS] = {
-  13, 14, 16, 17, 18, 19
-};
-
-
-Servo myServos[NUM_SERVOS];
-
-float pi = 3.1415926f;
-int  TotalNum = NUM_SERVOS;
-
-// Attach all servos
 void attachAllServos() {
   Serial.println("[DEBUG] attachAllServos() start");
   for (int i = 0; i < NUM_SERVOS; i++) {
     myServos[i].attach(servoPins[i], 500, 2400);
-    myServos[i].write(90);
   }
 }
 
-// center all servos at `val` (default 90)
-void centerAll(int val = 90, int d = 15) {
+void centerAll() {
   Serial.println("[DEBUG] centerAll() start");
-  for (int i = 0; i < TotalNum; i++) {
-    myServos[i].write(val);
-    delay(d);
-  }
-}
-
-// Straight snake
-void straightline() {
-  Serial.println("[DEBUG] straightline() start");
-  for (int i = 0; i < TotalNum; i++)
-  {
+  for (int i = 0; i < NUM_SERVOS; i++) {
     myServos[i].write(90);
     delay(15);
   }
 }
 
-struct SlitherState {
-  int offset;
-  int amplitude;
-  int speed;
-  float wavelengths;
-
-  int deg;                    // current degree (0..359)
-  unsigned long lastUpdateMs; // last time we updated servos
-};
-
-SlitherState g_slither = {
-  0, 35, 2, 1.5,   // default params
-  0, 0
-};
-
-// Set current gait parameters
-void setSlitherParams(int offset, int Amplitude, int Speed, float Wavelengths) {
-  g_slither.offset      = offset;
-  g_slither.amplitude   = Amplitude;
-  g_slither.speed       = Speed;
+void setSlitherParams(float offset, int Amplitude, float Speed, float Wavelengths) {
+  g_slither.offset = offset;
+  g_slither.amplitude = Amplitude;
+  g_slither.speed = Speed;
   g_slither.wavelengths = Wavelengths;
 }
 
-// Do ONE small slither step (non-blocking)
+float get_yaw_game() {
+  float r = imuVal.un.gameRotationVector.real;
+  float i = imuVal.un.gameRotationVector.i;
+  float j = imuVal.un.gameRotationVector.j;
+  float k = imuVal.un.gameRotationVector.k;
+
+  float ys = 2.0f * (r * k + i * j);
+  float yc = 1.0f - 2.0f * (j * j + k * k);
+  float yaw_game = wrap360(atan2f(ys, yc) * 180.0f / PI);
+
+  return yaw_game;
+}
+
+void updateHeadingFromIMU() {
+  if (bno.getSensorEvent(&imuVal) &&
+      imuVal.sensorId == SH2_GAME_ROTATION_VECTOR) {
+
+    g_heading.trueDeg = get_yaw_game();
+    g_heading.haveHeading = true;
+
+    DO_PERIODIC_MS(PRINT_PERIOD_MS) {
+      Serial.print("GAME heading (relative): ");
+      Serial.println(g_heading.trueDeg);
+    }
+  }
+}
+
+float getFilteredErr(float targetDeg) {
+  constexpr float alpha = 0.04f;
+
+  if (!g_heading.filtInit) {
+    g_heading.filtDeg = g_heading.trueDeg;
+    g_heading.filtInit = true;
+  } else {
+    const float diff = wrap180(g_heading.trueDeg - g_heading.filtDeg);
+    g_heading.filtDeg = wrap360(g_heading.filtDeg + alpha * diff);
+  }
+
+  return wrap180(targetDeg - g_heading.filtDeg);
+}
+
+void moveTowardsHeading(float targetDeg) {
+  DO_PERIODIC_MS(20) {
+    if (!g_heading.haveHeading) return;
+
+    float Kp = 0.7f;
+    constexpr float maxOffset = 11.25f;
+    static bool init = false;
+    constexpr float alphaOffset = 0.5f;
+
+    float filtErr = getFilteredErr(targetDeg);
+    float offset = clampf(Kp * filtErr, -maxOffset, maxOffset);
+
+    static float filtOffset = 0.0f;
+    if (!init) {
+      filtOffset = offset;
+      init = true;
+    } else {
+      filtOffset += alphaOffset * (offset - filtOffset);
+    }
+
+    setSlitherParams(filtOffset,
+                     RUN_SLITHER_STATE.amplitude,
+                     RUN_SLITHER_STATE.speed,
+                     RUN_SLITHER_STATE.wavelengths);
+
+    DO_PERIODIC_MS(PRINT_PERIOD_MS) {
+      if (imuVal.status < 3) {
+        Serial.printf("!!!WARNING: IMU status=%d!!!\n", imuVal.status);
+      }
+      Serial.print("Filtered error: ");
+      Serial.print(filtErr);
+      Serial.print(" | Filtered heading: ");
+      Serial.print(g_heading.filtDeg);
+      Serial.print(" | Target heading: ");
+      Serial.print(targetDeg);
+      Serial.print(" | Filt Offset: ");
+      Serial.println(filtOffset);
+    }
+  }
+}
+
 void slitherStep() {
-  const unsigned long now = millis();
-  const unsigned long updatePeriodMs = 10;   // like your old delay(10)
+  DO_PERIODIC_MS(20) {
+    const float Shift = 2.0f * PI / NUM_SERVOS;
+    g_slither.phase += (float)g_slither.speed * 0.12f;
 
-  // Only update servos every 10 ms
-  if (now - g_slither.lastUpdateMs < updatePeriodMs) {
-    return;
-  }
-  g_slither.lastUpdateMs = now;
+    for (int i = 0; i < NUM_SERVOS; i++) {
+      float theta = 90.0f
+                  + g_slither.offset
+                  + g_slither.amplitude * sinf(g_slither.phase + i * g_slither.wavelengths * Shift);
 
-  float Shift = 2 * pi / NUM_SERVOS;
-  float rads  = g_slither.deg * pi / 180.0f;
-
-  for (int j = 0; j < NUM_SERVOS; j++) {
-    float theta = 90
-                + g_slither.offset
-                + g_slither.amplitude *
-                  sin(g_slither.speed * rads + j * g_slither.wavelengths * Shift);
-    int Position = int(theta);
-    myServos[j].write(Position);
-  }
-
-  g_slither.deg++;
-  if (g_slither.deg >= 360) {
-    g_slither.deg = 0;
+      myServos[i].write((int)clampf(theta, 0, 180));
+    }
   }
 }
 
+/*********************************************
+* WIFI / UDP HELPERS
+**********************************************/
+void connectWiFi() {
+  WiFi.disconnect(true);
+  delay(500);
+  WiFi.mode(WIFI_STA);
 
-// ========================= HEADING-BASED GAIT =========================
+  WiFi.begin(SSID);
 
-// Basic turn parameters (tweak to taste)
-const int   TURN_OFFSET_LEFT  = +30;  // offset added to base angle when turning left
-const int   TURN_OFFSET_RIGHT = -30;  // offset added to base angle when turning right
-const int   TURN_AMPLITUDE    = 35;
-const int   TURN_SPEED        = 4;
-const float TURN_WAVELENGTHS  = 1.5f;
-// Heading control mode with hysteresis to avoid chattering
-enum HeadingMode {
-  HEADING_STRAIGHT,
-  HEADING_TURN_LEFT,
-  HEADING_TURN_RIGHT
-};
+  esp_wifi_sta_wpa2_ent_set_identity((uint8_t*)EAP_IDENTITY, strlen(EAP_IDENTITY));
+  esp_wifi_sta_wpa2_ent_set_username((uint8_t*)EAP_USERNAME, strlen(EAP_USERNAME));
+  esp_wifi_sta_wpa2_ent_set_password((uint8_t*)EAP_PASSWORD, strlen(EAP_PASSWORD));
+  esp_wifi_sta_wpa2_ent_enable();
 
-HeadingMode g_heading_mode = HEADING_STRAIGHT;
+  Serial.print("Connecting to ");
+  Serial.println(SSID);
 
-
-// Move so that TRUE heading tends toward target_true_deg
-void moveTowardsHeading(float target_true_deg, float tol_deg = 5.0f) {
-  // Re-evaluate heading control at a slower rate than servo update
-  static unsigned long lastCtrlMs = 0;
-  const unsigned long CTRL_PERIOD_MS = 200;   // 5 Hz control
-
-  unsigned long now = millis();
-  if (now - lastCtrlMs < CTRL_PERIOD_MS) {
-    return;   // keep previous gait
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 30000) {
+    delay(500);
+    Serial.print(".");
   }
-  lastCtrlMs = now;
+  Serial.println();
 
-  // Decide gait, do NOT block
-  if (!g_have_heading) {
-    // No heading yet, just go straight-ish
-    setSlitherParams(0, 35, 2, 1.5);  // straightline-ish params
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("Connected!");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("FAILED to connect.");
+  }
+}
+
+void initUDP() {
+  Udp.begin(UDP_PORT);
+  Serial.print("UDP listening on port ");
+  Serial.println(UDP_PORT);
+}
+
+bool getParamValue(const char* msg, const char* key, char* out, size_t outSize) {
+  if (!msg || !key || !out || outSize == 0) return false;
+
+  const char* p = strstr(msg, key);
+  if (!p) return false;
+
+  p += strlen(key);
+  if (*p != '=') return false;
+  p++;
+
+  size_t n = 0;
+  while (*p && *p != ',' && n + 1 < outSize) {
+    out[n++] = *p++;
+  }
+  out[n] = '\0';
+  return n > 0;
+}
+
+void stopMotion() {
+  setSlitherParams(0.0f, 0, 0.0f, 0.0f);
+  centerAll();
+  g_runState = RunState::Idle;
+  Serial.println("STOP command executed");
+}
+
+void handleCommand(const char* cmd, float directionDeg) {
+  if (!cmd) return;
+
+  if (strcmp(cmd, "STOP") == 0) {
+    stopMotion();
     return;
   }
 
-  target_true_deg = wrap360(target_true_deg);
+  if (strcmp(cmd, "GO") == 0) {
+    if (!g_heading.haveHeading) {
+      Serial.println("GO received but heading not available yet");
+      return;
+    }
 
-  float current = g_true_heading;   // filtered heading
-  float error   = wrap180(target_true_deg - current);
+    g_targetHeading = wrap360(g_heading.trueDeg + directionDeg);
+    g_heading.filtInit = false;  // reset filter around new target
+    g_runState = RunState::Running;
 
-  // Interpret tol_deg as the OUTER tolerance; inner is half of that.
-  if (tol_deg <= 0.0f) {
-    tol_deg = 15.0f; // default outer tolerance if caller passes 0
-  }
-  float tol_outer = tol_deg;
-  float tol_inner = tol_deg * 0.5f;  // inner hysteresis band
-  if (tol_inner > tol_outer) {
-    tol_inner = tol_outer;
-  }
-
-  Serial.print("Target ");
-  Serial.print(target_true_deg);
-  Serial.print("°, current ");
-  Serial.print(current);
-  Serial.print("°, error ");
-  Serial.println(error);
-
-  // --- decide mode with hysteresis ---
-  switch (g_heading_mode) {
-    case HEADING_STRAIGHT:
-      if (error >  tol_outer) {
-        g_heading_mode = HEADING_TURN_LEFT;
-      } else if (error < -tol_outer) {
-        g_heading_mode = HEADING_TURN_RIGHT;
-      }
-      break;
-
-    case HEADING_TURN_LEFT:
-      if (fabs(error) < tol_inner) {
-        g_heading_mode = HEADING_STRAIGHT;
-      }
-      break;
-
-    case HEADING_TURN_RIGHT:
-      if (fabs(error) < tol_inner) {
-        g_heading_mode = HEADING_STRAIGHT;
-      }
-      break;
+    Serial.print("GO received, direction = ");
+    Serial.print(directionDeg);
+    Serial.print(" deg, target heading = ");
+    Serial.println(g_targetHeading);
+    return;
   }
 
-  // --- choose gait from mode ---
-  if (g_heading_mode == HEADING_STRAIGHT) {
-    // Roughly facing the right way -> forward gait
-    setSlitherParams(0, 35, 3, 1.5);
-  } else if (g_heading_mode == HEADING_TURN_LEFT) {
-    // Need to increase heading (empirically "left") -> one biased gait
-    setSlitherParams(TURN_OFFSET_RIGHT, TURN_AMPLITUDE, TURN_SPEED, TURN_WAVELENGTHS);
-  } else { // HEADING_TURN_RIGHT
-    // Need to decrease heading -> opposite biased gait
-    setSlitherParams(TURN_OFFSET_LEFT, TURN_AMPLITUDE, TURN_SPEED, TURN_WAVELENGTHS);
+  Serial.print("Unknown cmd: ");
+  Serial.println(cmd);
+}
+
+void processUdpPackets() {
+  int packetSize = Udp.parsePacket();
+  if (packetSize <= 0) return;
+
+  int len = Udp.read(udpBuf, sizeof(udpBuf) - 1);
+  if (len <= 0) return;
+  udpBuf[len] = '\0';
+
+  Serial.print("UDP RX: ");
+  Serial.println(udpBuf);
+
+  char cmdBuf[32] = {0};
+  char dirBuf[32] = {0};
+
+  bool haveCmd = getParamValue(udpBuf, "cmd", cmdBuf, sizeof(cmdBuf));
+  bool haveDir = getParamValue(udpBuf, "direction", dirBuf, sizeof(dirBuf));
+
+  float directionDeg = 0.0f;
+  if (haveDir) {
+    directionDeg = atof(dirBuf);
+  }
+
+  if (haveCmd) {
+    handleCommand(cmdBuf, directionDeg);
+  } else {
+    Serial.println("Packet missing cmd field");
   }
 }
-// ========================= SETUP / LOOP =========================
 
+/*********************************************
+* SETUP
+**********************************************/
 void setup() {
   Serial.println("[DEBUG] setup() start");
   Serial.begin(115200);
@@ -314,31 +407,51 @@ void setup() {
 
   initIMU();
   attachAllServos();
-  straightline();
+  centerAll();
 
-  Serial.print("Delay Complete");
+  connectWiFi();
+  initUDP();
+
+  Serial.println("Setup complete");
 }
 
+/*********************************************
+* LOOP
+**********************************************/
 void loop() {
-  // 1. Get latest IMU sample (non-blocking)
-  updateHeadingFromIMU();
-  Serial.println("[DEBUG] loop() start");
-  // Grab any new IMU sample (non-blocking)
-  Serial.println("Start Update");
-  // updateHeadingFromIMU();
-  Serial.println("Finish Update");
+  static const uint32_t bootMs = millis();
 
-  if (g_have_heading) {
-    Serial.print("TRUE heading: ");
-    Serial.print(g_true_heading);
-    Serial.println(" deg");
-  } else {
-    Serial.println("Waiting for IMU heading...");
+  if (bno.wasReset()) {
+    Serial.println("!!! WARNING: BNO08x RESET detected !!! -> re-enabling reports");
+    setReports();
+    g_heading.haveHeading = false;
+    g_heading.filtInit = false;
   }
 
-  // Keep moving while trying to face 90° TRUE
-  moveTowardsHeading(355, 50.0f);
+  updateHeadingFromIMU();
+  processUdpPackets();
 
-  // 3. Advance the gait one tiny step
-  slitherStep();
+  switch (g_runState) {
+    case RunState::Warmup:
+      setSlitherParams(0, 0, 0, 1.0f);
+      if (millis() - bootMs >= 5000) {
+        g_runState = RunState::WaitForHeading;
+      }
+      break;
+
+    case RunState::WaitForHeading:
+      if (!g_heading.haveHeading) return;
+      g_runState = RunState::Idle;
+      Serial.println("Heading ready, entering IDLE");
+      break;
+
+    case RunState::Idle:
+      slitherStep();
+      break;
+
+    case RunState::Running:
+      moveTowardsHeading(g_targetHeading);
+      slitherStep();
+      break;
+  }
 }
