@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import math
 import socket
+import time
 
 # ---------- IDs ----------
 REF_IDS = [3, 4, 5, 6]  # fixed reference tags
@@ -9,26 +10,26 @@ SNAKE_ID = 1
 OBJECT_ID = 2
 
 # ---------- Real-world reference tag centers (meters) ----------
-# WORLD_REF_METERS = {
-# 3: (0.00, 0.00),
-# 4: (1.524, 0.00),
-# 5: (0.00, 2.769),
-# 6: (1.524, 2.769),
-# }
-
 WORLD_REF_METERS = {
-    3: (0.00, 0.00),
-    4: (1.83, 0.00),
-    5: (0.00, 1.83),
-    6: (1.83, 1.83),
+3: (0.00, 0.00),
+4: (2.4384, 0.00),
+5: (0.00, 2.4384),
+6: (2.4384, 2.4384),
 }
+
+# WORLD_REF_METERS = {
+#     3: (0.00, 0.00),
+#     4: (1.83, 0.00),
+#     5: (0.00, 1.83),
+#     6: (1.83, 1.83),
+# }
 
 # ---------- Camera ----------
 CAM_INDEX = 1
 REQ_W, REQ_H = 3840, 2160
 
 # ---------- ESP32 UDP ----------
-ESP_IP = "100.67.23.17"
+ESP_IP = "100.66.148.72"
 ESP_PORT = 6657
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -49,6 +50,10 @@ BUTTONS = {
     "go": (20, 52, 110, 88),
     "stop": (120, 52, 235, 88),
     "quit": (245, 52, 340, 88),
+    "north": (1720, 45, 1780, 85),
+    "west": (1655, 90, 1715, 130),
+    "east": (1785, 90, 1845, 130),
+    "south": (1720, 135, 1780, 175),
 }
 
 
@@ -239,6 +244,15 @@ def mouse_callback(event, x, y, flags, param):
     elif point_in_rect(x, y, BUTTONS["quit"]):
         pending_command = "quit"
 
+    elif point_in_rect(x, y, BUTTONS["north"]):
+        pending_command = "north"
+    elif point_in_rect(x, y, BUTTONS["south"]):
+        pending_command = "south"
+    elif point_in_rect(x, y, BUTTONS["east"]):
+        pending_command = "east"
+    elif point_in_rect(x, y, BUTTONS["west"]):
+        pending_command = "west"
+
 
 # Draws a semi-transparent filled rectangle on top of the frame.
 # Used for dashboard backgrounds and buttons.
@@ -325,6 +339,12 @@ def draw_dashboard(frame, latest_nav, visible_refs):
     draw_button(frame, BUTTONS["stop"], "STOP", (0, 140, 230))
     draw_button(frame, BUTTONS["quit"], "QUIT", (0, 0, 210))
 
+    # directional pad (D-Pad)
+    draw_button(frame, BUTTONS["north"], "N", (70, 70, 70))
+    draw_button(frame, BUTTONS["west"], "W", (70, 70, 70))
+    draw_button(frame, BUTTONS["east"], "E", (70, 70, 70))
+    draw_button(frame, BUTTONS["south"], "S", (70, 70, 70))
+
 
 # Main program loop.
 # Responsibilities:
@@ -361,9 +381,12 @@ def main():
 
     if not cap.isOpened():
         raise RuntimeError(f"Could not open camera index {CAM_INDEX}")
+    
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, REQ_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, REQ_H)
+    cap.set(cv2.CAP_PROP_FPS, 60.0)
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
@@ -371,6 +394,7 @@ def main():
     cv2.setMouseCallback(WINDOW_NAME, mouse_callback)
 
     latest_nav = None
+    stored_nav = None
 
     while True:
 
@@ -430,6 +454,7 @@ def main():
                     "snake_heading_deg": heading_deg,
                     "relative_deg": rel_deg,
                 }
+                stored_nav = latest_nav
 
         vis = [tid for tid in REF_IDS if tid in id_to_corners]
 
@@ -442,19 +467,17 @@ def main():
 
             last_command = "GO"
 
-            if latest_nav is None or latest_nav["relative_deg"] is None:
+            if stored_nav is None or stored_nav["relative_deg"] is None:
 
                 system_state = "WAITING"
                 status_message = "Nav unavailable"
 
-                print("GO requested, but navigation data is not available.")
-
-                send_go_command(15, 15)
+                print("GO requested, but no navigation data has been seen yet.")
 
             else:
 
-                rel_deg = latest_nav["relative_deg"]
-                d = latest_nav["distance_m"]
+                rel_deg = stored_nav["relative_deg"]
+                d = stored_nav["distance_m"]
 
                 if abs(rel_deg) < 5.0:
                     turn_msg = "Straight"
@@ -465,7 +488,7 @@ def main():
 
                 system_state = "RUNNING"
                 status_message = turn_msg
-
+                
                 send_go_command(rel_deg, d)
 
         elif cmd_to_run == "stop":
@@ -478,6 +501,34 @@ def main():
 
             send_stop_command()
 
+        elif cmd_to_run == "north":
+            last_command = "NORTH"
+            system_state = "RUNNING"
+            status_message = "Heading North"
+            print("snake direction: north")
+            send_udp_message("cmd=NORTH")
+        
+        elif cmd_to_run == "south":
+            last_command = "SOUTH"
+            system_state = "RUNNING"
+            status_message = "Heading South"
+            print("snake direction: south")
+            send_udp_message("cmd=SOUTH")
+
+        elif cmd_to_run == "east":
+            last_command = "EAST"
+            system_state = "RUNNING"
+            status_message = "Heading East"
+            print("snake direction: east")
+            send_udp_message("cmd=EAST")
+
+        elif cmd_to_run == "west":
+            last_command = "WEST"
+            system_state = "RUNNING"
+            status_message = "Heading West"
+            print("snake direction: west")
+            send_udp_message("cmd=WEST")
+
         elif cmd_to_run == "quit":
 
             last_command = "QUIT"
@@ -489,6 +540,7 @@ def main():
             send_stop_command()
 
             break
+
 
         cv2.imshow(WINDOW_NAME, frame)
 

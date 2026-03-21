@@ -223,9 +223,9 @@ void moveTowardsHeading(float targetDeg) {
     if (!g_heading.haveHeading) return;
 
     float Kp = 0.7f;
-    constexpr float maxOffset = 11.25f;
+    constexpr float maxOffset = 20.0f;
     static bool init = false;
-    constexpr float alphaOffset = 0.5f;
+    constexpr float alphaOffset = 0.8f;
 
     float filtErr = getFilteredErr(targetDeg);
     float offset = clampf(Kp * filtErr, -maxOffset, maxOffset);
@@ -353,14 +353,50 @@ void handleCommand(const char* cmd, float directionDeg) {
       return;
     }
 
-    g_targetHeading = wrap360(g_heading.trueDeg + directionDeg);
-    g_heading.filtInit = false;  // reset filter around new target
+    // FIX 1: Compute target relative to the stable filtered average path (filtDeg), 
+    // rather than the instantaneously oscillating head orientation (trueDeg)
+    g_targetHeading = wrap360(g_heading.filtDeg + directionDeg);
+    
+    // FIX 2: Do NOT reset the tracking filter! (Removed g_heading.filtInit = false)
+    // The filter tracks our current physical attitude and must persist smoothly.
     g_runState = RunState::Running;
 
     Serial.print("GO received, direction = ");
     Serial.print(directionDeg);
     Serial.print(" deg, target heading = ");
     Serial.println(g_targetHeading);
+    return;
+  }
+
+  if (strcmp(cmd, "NORTH") == 0) {
+    if (!g_heading.haveHeading) return;
+    g_targetHeading = 0.0f;
+    g_runState = RunState::Running;
+    Serial.println("NORTH received, target heading = 0.0");
+    return;
+  }
+
+  if (strcmp(cmd, "SOUTH") == 0) {
+    if (!g_heading.haveHeading) return;
+    g_targetHeading = 180.0f;
+    g_runState = RunState::Running;
+    Serial.println("SOUTH received, target heading = 180.0");
+    return;
+  }
+
+  if (strcmp(cmd, "EAST") == 0) {
+    if (!g_heading.haveHeading) return;
+    g_targetHeading = 270.0f; // wrap360(-90)
+    g_runState = RunState::Running;
+    Serial.println("EAST received, target heading = 270.0");
+    return;
+  }
+
+  if (strcmp(cmd, "WEST") == 0) {
+    if (!g_heading.haveHeading) return;
+    g_targetHeading = 90.0f;
+    g_runState = RunState::Running;
+    Serial.println("WEST received, target heading = 90.0");
     return;
   }
 
