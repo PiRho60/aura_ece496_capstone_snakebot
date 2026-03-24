@@ -12,10 +12,17 @@ OBJECT_ID = 2
 # ---------- Real-world reference tag centers (meters) ----------
 WORLD_REF_METERS = {
 3: (0.00, 0.00),
-4: (2.4384, 0.00),
-5: (0.00, 2.4384),
-6: (2.4384, 2.4384),
+4: (2.667, 0.00),
+5: (0.00, 3.1),
+6: (2.667, 3.1),
 }
+
+# WORLD_REF_METERS = {
+# 3: (0.00, 0.00),
+# 4: (2.4384, 0.00),
+# 5: (0.00, 2.4384),
+# 6: (2.4384, 2.4384),
+# }
 
 # WORLD_REF_METERS = {
 #     3: (0.00, 0.00),
@@ -29,7 +36,7 @@ CAM_INDEX = 1
 REQ_W, REQ_H = 3840, 2160
 
 # ---------- ESP32 UDP ----------
-ESP_IP = "100.66.148.72"
+ESP_IP = "100.66.155.161"
 ESP_PORT = 6657
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -184,36 +191,25 @@ def signed_angle_deg(v1x, v1y, v2x, v2y):
 # Forward is defined using the LEFT edge midpoint of the tag,
 # so this assumes the snake forward direction corresponds to the tag -x axis.
 def get_snake_pose_world(H, snake_corners_px):
-    """
-    Returns:
-        sx, sy            = snake center in world frame
-        hx, hy            = unit vector of snake FORWARD axis in world frame (defined as tag -x)
-        heading_deg       = absolute heading in world frame (0 = -X, CCW positive)
-    """
-
     center_px = tag_center_from_corners(snake_corners_px)
 
-    # corner order assumed [TL, TR, BR, BL]
-    # use LEFT edge midpoint so forward = tag -x
-    left_mid_px = 0.5 * (snake_corners_px[0] + snake_corners_px[3])
+    # choose the tag side that actually points toward the snake nose
+    forward_mid_px = 0.5 * (snake_corners_px[2] + snake_corners_px[3])  # example: bottom edge
 
     sx, sy = img_to_world(H, center_px)
-    fx, fy = img_to_world(H, left_mid_px)
+    fx, fy = img_to_world(H, forward_mid_px)
 
     hx = fx - sx
     hy = fy - sy
 
     hnorm = normalize(hx, hy)
-
     if hnorm is None:
         return None
 
     hx, hy = hnorm
 
-    # now hx,hy already points along tag -x
-    # define 0 deg at world -X
-    heading_deg = (math.degrees(math.atan2(hy, hx)) - 180.0 + 360.0) % 360.0
-
+    heading_deg = math.degrees(math.atan2(hy, hx))
+    heading_deg = (heading_deg + 180) % 360 - 180
     return sx, sy, hx, hy, heading_deg
 
 
@@ -295,7 +291,7 @@ def draw_button(frame, rect, label, fill_color, text_color=(255, 255, 255)):
 # - status message
 # - visible reference tags
 # - current distance / angle / heading if available
-def draw_dashboard(frame, latest_nav, visible_refs):
+def draw_dashboard(frame, latest_nav, visible_refs, stored_nav=None):
 
     # Top status line
     if latest_nav is not None and latest_nav["relative_deg"] is not None:
@@ -310,6 +306,11 @@ def draw_dashboard(frame, latest_nav, visible_refs):
         ang_str = "N/A"
         heading_str = "N/A"
 
+    if stored_nav is not None and stored_nav["relative_deg"] is not None:
+        stored_ang_str = f"{stored_nav['relative_deg']:.1f}deg"
+    else:
+        stored_ang_str = "N/A"
+
     top_line = (
         f"STATE: {system_state}, "
         f"CMD: {last_command}, "
@@ -317,6 +318,7 @@ def draw_dashboard(frame, latest_nav, visible_refs):
         f"REFS: {visible_refs}, "
         f"DIST: {dist_str}, "
         f"ANGLE: {ang_str}, "
+        f"STORED_ANGLE: {stored_ang_str}, "
         f"HEADING: {heading_str}"
     )
 
@@ -458,7 +460,7 @@ def main():
 
         vis = [tid for tid in REF_IDS if tid in id_to_corners]
 
-        draw_dashboard(frame, latest_nav, vis)
+        draw_dashboard(frame, latest_nav, vis, stored_nav)
 
         cmd_to_run = pending_command
         pending_command = None
