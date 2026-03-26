@@ -489,7 +489,6 @@ void loop() {
       break;
 
     case RunState::Idle:
-      slitherStep();
       break;
 
     case RunState::Running:
