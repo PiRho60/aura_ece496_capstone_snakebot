@@ -1,4 +1,4 @@
-# Invasion of the Snake Robot
+# Aura - Invasion of the Snake Robot
 
 A low-cost embedded snake robot that demonstrates lateral-undulation locomotion, wireless control, IMU-based heading control, and off-board AprilTag-based target navigation.
 
