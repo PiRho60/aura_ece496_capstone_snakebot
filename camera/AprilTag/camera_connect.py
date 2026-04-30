@@ -36,7 +36,7 @@ CAM_INDEX = 1
 REQ_W, REQ_H = 3840, 2160
 
 # ---------- ESP32 UDP ----------
-ESP_IP = "100.66.155.161"
+ESP_IP = "YOUR_ESP32_IP"
 ESP_PORT = 6657
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

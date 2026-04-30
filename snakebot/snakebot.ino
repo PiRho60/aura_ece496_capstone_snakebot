@@ -13,12 +13,12 @@
 #include <stdlib.h>
 
 /*********************************************
-* WIFI / UDP
+* WIFI / UDPx
 **********************************************/
-const char* SSID = "UofT";
-const char* EAP_IDENTITY = "quwenhao";
-const char* EAP_USERNAME = "quwenhao";
-const char* EAP_PASSWORD = "Maplehong0102";
+const char* SSID = "YOUR_WIFI_SSID";
+const char* EAP_IDENTITY = "YOUR_EAP_IDENTITY";
+const char* EAP_USERNAME = "YOUR_EAP_USERNAME";
+const char* EAP_PASSWORD = "YOUR_EAP_PASSWORD";
 
 constexpr uint16_t UDP_PORT = 6657;
 WiFiUDP Udp;
@@ -38,6 +38,8 @@ sh2_SensorValue_t imuVal;
 int servoPins[NUM_SERVOS] = { 33, 32, 22, 21, 17, 16, 14, 13 };
 Servo myServos[NUM_SERVOS];
 constexpr float TURNING_DEGREE = 45.0f;
+static bool g_offsetInit = false;
+static float g_filtOffset = 0.0f;
 
 // Returns true once per `period_ms` for each unique call-site.
 #define DO_PERIODIC_MS(period_ms) \
@@ -76,9 +78,9 @@ struct SlitherState {
   uint32_t lastUpdateMs;
   float phase;
 };
-const SlitherState RUN_SLITHER_STATE = { 0.0f, 30, 1.0f, 1.0f, 0, 0.0f };
+const SlitherState RUN_SLITHER_STATE = { 0.0f, 30, 1.35f, 1.0f, 0, 0.0f };
 const SlitherState STOP_SLITHER_STATE = { 0.0f, 0, 0.0f, 1.0f, 0, 0.0f };
-SlitherState g_slither = { 0.0f, 30, 1.0f, 1.0f, 0, 0.0f };
+SlitherState g_slither = { 0.0f, 30, 1.35f, 1.0f, 0, 0.0f };
 
 /*********************************************
 * COMMAND STATE
@@ -223,25 +225,23 @@ void moveTowardsHeading(float targetDeg) {
     if (!g_heading.haveHeading) return;
 
     float Kp = 0.7f;
-    constexpr float maxOffset = 20.0f;
-    static bool init = false;
+    constexpr float maxOffset = 15.0f;
     constexpr float alphaOffset = 0.8f;
 
     float filtErr = getFilteredErr(targetDeg);
     float offset = clampf(Kp * filtErr, -maxOffset, maxOffset);
 
-    static float filtOffset = 0.0f;
-    if (!init) {
-      filtOffset = offset;
-      init = true;
+    if (!g_offsetInit) {
+      g_filtOffset = offset;
+      g_offsetInit = true;
     } else {
-      filtOffset += alphaOffset * (offset - filtOffset);
+      g_filtOffset += alphaOffset * (offset - g_filtOffset);
     }
 
-    setSlitherParams(filtOffset,
-                     RUN_SLITHER_STATE.amplitude,
-                     RUN_SLITHER_STATE.speed,
-                     RUN_SLITHER_STATE.wavelengths);
+    setSlitherParams(g_filtOffset,
+                    RUN_SLITHER_STATE.amplitude,
+                    RUN_SLITHER_STATE.speed,
+                    RUN_SLITHER_STATE.wavelengths);
 
     DO_PERIODIC_MS(PRINT_PERIOD_MS) {
       if (imuVal.status < 3) {
@@ -254,7 +254,7 @@ void moveTowardsHeading(float targetDeg) {
       Serial.print(" | Target heading: ");
       Serial.print(targetDeg);
       Serial.print(" | Filt Offset: ");
-      Serial.println(filtOffset);
+      Serial.println(g_filtOffset);
     }
   }
 }
@@ -335,6 +335,10 @@ bool getParamValue(const char* msg, const char* key, char* out, size_t outSize) 
 void stopMotion() {
   setSlitherParams(0.0f, 0, 0.0f, 0.0f);
   centerAll();
+
+  g_offsetInit = false;
+  g_filtOffset = 0.0f;
+
   g_runState = RunState::Idle;
   Serial.println("STOP command executed");
 }
@@ -353,16 +357,19 @@ void handleCommand(const char* cmd, float directionDeg) {
       return;
     }
 
-    // FIX 1: Compute target relative to the stable filtered average path (filtDeg), 
-    // rather than the instantaneously oscillating head orientation (trueDeg)
-    g_targetHeading = wrap360(g_heading.filtDeg + directionDeg);
-    
-    // FIX 2: Do NOT reset the tracking filter! (Removed g_heading.filtInit = false)
-    // The filter tracks our current physical attitude and must persist smoothly.
+    g_heading.filtDeg = g_heading.trueDeg;
+    g_heading.filtInit = true;
+
+    g_offsetInit = false;
+    g_filtOffset = 0.0f;
+
+    g_targetHeading = wrap360(g_heading.trueDeg + directionDeg);
     g_runState = RunState::Running;
 
     Serial.print("GO received, direction = ");
     Serial.print(directionDeg);
+    Serial.print(" deg, current heading = ");
+    Serial.print(g_heading.trueDeg);
     Serial.print(" deg, target heading = ");
     Serial.println(g_targetHeading);
     return;
@@ -469,7 +476,7 @@ void loop() {
 
   switch (g_runState) {
     case RunState::Warmup:
-      setSlitherParams(0, 0, 0, 1.0f);
+      setSlitherParams(0, 0, 0, 0);
       if (millis() - bootMs >= 5000) {
         g_runState = RunState::WaitForHeading;
       }
@@ -482,7 +489,6 @@ void loop() {
       break;
 
     case RunState::Idle:
-      slitherStep();
       break;
 
     case RunState::Running:
