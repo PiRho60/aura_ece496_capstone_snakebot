@@ -4,6 +4,8 @@ A low-cost embedded snake robot project that demonstrates lateral-undulation loc
 
 The robot is controlled by an ESP32 that drives an 8-servo segmented body. A separate Python/OpenCV program processes camera input, detects AprilTags, estimates the robot and target positions, displays a control GUI, and sends UDP commands to the ESP32.
 
+<img width="2048" height="1146" alt="image" src="https://github.com/user-attachments/assets/4618d27f-6eec-4431-a5a7-1cde053f0e7a" />
+
 ## Key Features
 
 - 8-segment servo-driven snake robot
